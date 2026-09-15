@@ -85,7 +85,7 @@ class IRPO(OnPolicyAlgorithm):
         allo_encoder_path: str | None = None,
         aggregation_method: Literal["uniform", "softmax", "argmax"] = "softmax",
         temperature: float = 1.0,
-        target_kl: float = 0.01,
+        target_kl: float = 0.001,
         trpo_damping: float = 0.1,
         trpo_cg_steps: int = 5,
         trpo_backtrack_iters: int = 10,
@@ -154,6 +154,9 @@ class IRPO(OnPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
+        if self.inner_learning_rate is None:
+            # IRPO's differentiable subpolicy updates use a fixed actor step.
+            self.inner_learning_rate = float(self.lr_schedule(1.0))
         self.intrinsic_provider = make_intrinsic_reward(
             self.intrinsic_reward_kind,
             self.num_options,
@@ -259,9 +262,9 @@ class IRPO(OnPolicyAlgorithm):
         loss = self._policy_loss(params, batch, advantages)
         values = tuple(params.values())
         gradients = torch.autograd.grad(loss, values, create_graph=True, allow_unused=True)
-        learning_rate = self.inner_learning_rate or self.lr_schedule(self._current_progress_remaining)
+        assert self.inner_learning_rate is not None
         return {
-            name: value - learning_rate * (gradient if gradient is not None else torch.zeros_like(value))
+            name: value - self.inner_learning_rate * (gradient if gradient is not None else torch.zeros_like(value))
             for (name, value), gradient in zip(params.items(), gradients)
         }
 

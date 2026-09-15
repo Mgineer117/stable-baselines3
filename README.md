@@ -45,6 +45,7 @@ Use `"MlpPolicy"` for vector observations and `"CnnPolicy"` for images.
 
 This SB3 port deliberately uses normalized discounted returns as the policy-gradient
 baseline. It does not train separate intrinsic and extrinsic critics.
+Subpolicy updates use a fixed `inner_learning_rate` (the initial `learning_rate` by default).
 
 ## Intrinsic reward
 
