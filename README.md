@@ -4,9 +4,9 @@ This fork adds **Intrinsic Reward Policy Optimization (IRPO)** to
 Stable-Baselines3. IRPO owns its intrinsic-reward providers:
 `random`, `allo`, `lirpg`, and `drnd`.
 
-> **Status:** The `IRPO` import and public configuration are present on the
-> `irpo` branch. The SB3-native differentiable option-rollout engine is still
-> being ported, so constructing `IRPO` is not executable yet.
+> **Status:** The first SB3-native IRPO implementation supports Box observations,
+> `MlpPolicy`/`CnnPolicy`, and SGD meta updates. Atari and MuJoCo parity with the
+> research implementation are still being validated.
 
 ## Install
 
@@ -33,7 +33,6 @@ model = IRPO(
     learning_rate=3e-4,
     n_steps=128,
     batch_size=128,
-    target_kl=0.01,
     verbose=1,
 )
 model.learn(100_000_000)
