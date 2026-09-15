@@ -41,6 +41,7 @@ Main Features
 
    guide/install
    guide/quickstart
+   guide/irpo
    guide/rl_tips
    guide/rl
    guide/algos
