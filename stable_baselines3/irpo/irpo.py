@@ -85,6 +85,11 @@ class IRPO(OnPolicyAlgorithm):
         allo_encoder_path: str | None = None,
         aggregation_method: Literal["uniform", "softmax", "argmax"] = "softmax",
         temperature: float = 1.0,
+        target_kl: float = 0.01,
+        trpo_damping: float = 0.1,
+        trpo_cg_steps: int = 5,
+        trpo_backtrack_iters: int = 10,
+        trpo_backtrack_coeff: float = 0.7,
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
         policy_kwargs: dict[str, Any] | None = None,
@@ -101,6 +106,8 @@ class IRPO(OnPolicyAlgorithm):
             raise ValueError("aggregation_method must be 'uniform', 'softmax', or 'argmax'")
         if temperature <= 0:
             raise ValueError("temperature must be positive")
+        if target_kl <= 0 or trpo_damping < 0 or trpo_cg_steps < 1 or trpo_backtrack_iters < 1:
+            raise ValueError("invalid TRPO hyperparameters")
         if not isinstance(env, str) and isinstance(env.observation_space, spaces.Dict):
             raise NotImplementedError("The initial IRPO port supports Box observations only")
 
@@ -131,6 +138,11 @@ class IRPO(OnPolicyAlgorithm):
         self.intrinsic_learning_rate = intrinsic_learning_rate
         self.aggregation_method = aggregation_method
         self.temperature = temperature
+        self.target_kl = target_kl
+        self.trpo_damping = trpo_damping
+        self.trpo_cg_steps = trpo_cg_steps
+        self.trpo_backtrack_iters = trpo_backtrack_iters
+        self.trpo_backtrack_coeff = trpo_backtrack_coeff
         self.intrinsic_reward_kind = intrinsic_reward
         self.allo_encoder_path = allo_encoder_path
         self.drnd_learning_rate = drnd_learning_rate
@@ -293,17 +305,91 @@ class IRPO(OnPolicyAlgorithm):
             parameter.grad = None if gradient is None else gradient.detach()
         self._lirpg_optimizer.step()
 
-    def _meta_update(self, loss: Tensor) -> float:
+    @staticmethod
+    def _flat(tensors: tuple[Tensor, ...]) -> Tensor:
+        return torch.cat([tensor.reshape(-1) for tensor in tensors])
+
+    def _meta_update(self, loss: Tensor, observations: Tensor) -> tuple[float, int, bool, float]:
+        """TRPO update using the IRPO outer gradient as the CG right-hand side."""
         parameters = tuple(self.policy.parameters())
-        gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
-        learning_rate = self.lr_schedule(self._current_progress_remaining)
-        norm = torch.zeros((), device=self.device)
+        raw_gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
+        gradients = tuple(
+            gradient if gradient is not None else torch.zeros_like(parameter)
+            for parameter, gradient in zip(parameters, raw_gradients)
+        )
+        gradient = self._flat(gradients).detach()
+        gradient_norm = gradient.norm().item()
+        if not torch.isfinite(gradient).all() or gradient_norm == 0:
+            return gradient_norm, 0, False, float("nan")
+
+        if observations.shape[0] > 256:
+            observations = observations[torch.randperm(observations.shape[0], device=self.device)[:256]]
         with torch.no_grad():
-            for parameter, gradient in zip(parameters, gradients):
-                if gradient is not None:
-                    parameter.add_(gradient, alpha=-learning_rate)
-                    norm += gradient.square().sum()
-        return norm.sqrt().item()
+            old_distribution = self.policy.get_distribution(observations)
+            old_actions = old_distribution.get_actions(deterministic=False)
+            old_log_prob = old_distribution.log_prob(old_actions)
+
+        def kl() -> Tensor:
+            distribution = self.policy.get_distribution(observations)
+            log_ratio = distribution.log_prob(old_actions) - old_log_prob
+            return ((torch.exp(log_ratio) - 1.0) - log_ratio).mean()
+
+        def fisher_vector_product(vector: Tensor) -> Tensor:
+            first = torch.autograd.grad(kl(), parameters, create_graph=True, allow_unused=True)
+            flat_first = self._flat(tuple(
+                value if value is not None else torch.zeros_like(parameter)
+                for parameter, value in zip(parameters, first)
+            ))
+            second = torch.autograd.grad((flat_first * vector).sum(), parameters, allow_unused=True)
+            return self._flat(tuple(
+                value if value is not None else torch.zeros_like(parameter)
+                for parameter, value in zip(parameters, second)
+            )).detach() + self.trpo_damping * vector
+
+        solution = torch.zeros_like(gradient)
+        residual = gradient.clone()
+        direction = gradient.clone()
+        residual_norm = torch.dot(residual, residual)
+        for _ in range(self.trpo_cg_steps):
+            curvature_direction = fisher_vector_product(direction)
+            denominator = torch.dot(direction, curvature_direction)
+            if not torch.isfinite(denominator) or denominator.abs() < 1e-12:
+                break
+            alpha = residual_norm / denominator
+            solution += alpha * direction
+            residual -= alpha * curvature_direction
+            next_residual_norm = torch.dot(residual, residual)
+            if not torch.isfinite(next_residual_norm) or next_residual_norm < 1e-10:
+                break
+            direction = residual + next_residual_norm / (residual_norm + 1e-8) * direction
+            residual_norm = next_residual_norm
+
+        curvature = 0.5 * torch.dot(solution, fisher_vector_product(solution))
+        if not torch.isfinite(curvature) or curvature <= 1e-12:
+            return gradient_norm, 0, False, float("nan")
+        full_step = solution / torch.sqrt(curvature / self.target_kl)
+        original = self._flat(tuple(parameter.detach() for parameter in parameters))
+
+        def set_parameters(flat: Tensor) -> None:
+            offset = 0
+            with torch.no_grad():
+                for parameter in parameters:
+                    size = parameter.numel()
+                    parameter.copy_(flat[offset : offset + size].reshape_as(parameter))
+                    offset += size
+
+        success = False
+        kl_value = float("nan")
+        backtrack = self.trpo_backtrack_iters - 1
+        for backtrack in range(self.trpo_backtrack_iters):
+            set_parameters(original - self.trpo_backtrack_coeff**backtrack * full_step)
+            kl_value = kl().item()
+            if np.isfinite(kl_value) and kl_value <= self.target_kl:
+                success = True
+                break
+        if not success:
+            set_parameters(original)
+        return gradient_norm, backtrack, success, kl_value
 
     def train(self) -> None:
         """IRPO trains inside :meth:`learn`; required by OnPolicyAlgorithm."""
@@ -372,11 +458,14 @@ class IRPO(OnPolicyAlgorithm):
             meta_loss = torch.sum(torch.stack(option_losses) * weights)
             self._update_lirpg(meta_loss)
             # Meta-policy update: apply the option-aggregated outer gradient to SB3 policy.
-            gradient_norm = self._meta_update(meta_loss)
+            gradient_norm, backtrack, trpo_success, trpo_kl = self._meta_update(meta_loss, base_batch.observations)
             iteration += 1
             self._n_updates += 1
             self.logger.record("train/meta_loss", meta_loss.item())
             self.logger.record("train/meta_gradient_norm", gradient_norm)
+            self.logger.record("train/trpo_backtrack", backtrack)
+            self.logger.record("train/trpo_success", trpo_success)
+            self.logger.record("train/trpo_kl", trpo_kl)
             self.logger.record("train/option_return", score_tensor.mean().item())
             self.logger.record("train/option_weight_max", weights.max().item())
             self.logger.record("train/selected_option", selected_option)
