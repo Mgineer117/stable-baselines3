@@ -305,6 +305,7 @@ class IRPO(OnPolicyAlgorithm):
         while self.num_timesteps < total_timesteps:
             callback.on_rollout_start()
             base_params = self._params()
+            # Subpolicy sample collection: base rollout, then option rollouts below.
             base_batch = self._collect_batch(self.env, base_params, callback)
             if base_batch is None:
                 break
@@ -322,6 +323,7 @@ class IRPO(OnPolicyAlgorithm):
                         if batch is None:
                             complete = False
                             break
+                    # Subpolicy update: differentiable intrinsic/extrinsic policy-gradient step.
                     params = self._adapt(params, batch, option, final)
                     if final:
                         final_batch = batch
@@ -341,6 +343,7 @@ class IRPO(OnPolicyAlgorithm):
             weights = self._weights(score_tensor)
             meta_loss = torch.sum(torch.stack(option_losses) * weights)
             self._update_lirpg(meta_loss)
+            # Meta-policy update: apply the option-aggregated outer gradient to SB3 policy.
             gradient_norm = self._meta_update(meta_loss)
             iteration += 1
             self._n_updates += 1
