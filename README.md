@@ -30,7 +30,7 @@ model = IRPO(
     intrinsic_reward="drnd",  # random | allo | lirpg | drnd
     num_options=3,
     num_subpolicy_updates=5,
-    learning_rate=3e-4,
+    subpolicy_learning_rate=3e-4,
     n_steps=128,
     batch_size=128,
     verbose=1,
@@ -45,7 +45,8 @@ Use `"MlpPolicy"` for vector observations and `"CnnPolicy"` for images.
 
 This SB3 port deliberately uses normalized discounted returns as the policy-gradient
 baseline. It does not train separate intrinsic and extrinsic critics.
-Subpolicy updates use a fixed `inner_learning_rate` (the initial `learning_rate` by default).
+Subpolicy updates use a fixed `subpolicy_learning_rate`. `lirpg_learning_rate`,
+`drnd_learning_rate`, and `allo_learning_rate` control their respective providers.
 
 ## Intrinsic reward
 

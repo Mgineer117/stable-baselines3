@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from copy import deepcopy
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ from torch.func import functional_call
 
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.irpo.intrinsic import IntrinsicReward, LIRPGReward, make_intrinsic_reward
@@ -72,7 +72,7 @@ class IRPO(OnPolicyAlgorithm):
         self,
         policy: str | type[ActorCriticPolicy],
         env: GymEnv | str,
-        learning_rate: float | Schedule = 3e-4,
+        subpolicy_learning_rate: float = 3e-4,
         n_steps: int = 128,
         gamma: float = 0.99,
         ent_coef: float = 0.0,
@@ -111,7 +111,8 @@ class IRPO(OnPolicyAlgorithm):
         super().__init__(
             policy,
             env,
-            learning_rate=learning_rate,
+            # SB3 creates a policy optimizer, but IRPO updates the base policy with TRPO.
+            learning_rate=0.0,
             n_steps=n_steps,
             gamma=gamma,
             gae_lambda=1.0,
@@ -131,8 +132,8 @@ class IRPO(OnPolicyAlgorithm):
         )
         self.num_options = num_options
         self.num_subpolicy_updates = num_subpolicy_updates
-        self.inner_learning_rate = inner_learning_rate
-        self.intrinsic_learning_rate = intrinsic_learning_rate
+        self.subpolicy_learning_rate = subpolicy_learning_rate
+        self.lirpg_learning_rate = lirpg_learning_rate
         self.temperature = temperature
         self.target_kl = target_kl
         self.trpo_damping = trpo_damping
@@ -142,6 +143,7 @@ class IRPO(OnPolicyAlgorithm):
         self.intrinsic_reward_kind = intrinsic_reward
         self.allo_encoder_path = allo_encoder_path
         self.drnd_learning_rate = drnd_learning_rate
+        self.allo_learning_rate = allo_learning_rate
         self._lirpg_optimizer: torch.optim.Optimizer | None = None
         self.evaluation_policy: ActorCriticPolicy | None = None
 
@@ -150,9 +152,6 @@ class IRPO(OnPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
-        if self.inner_learning_rate is None:
-            # IRPO's differentiable subpolicy updates use a fixed actor step.
-            self.inner_learning_rate = float(self.lr_schedule(1.0))
         self.intrinsic_provider = make_intrinsic_reward(
             self.intrinsic_reward_kind,
             self.num_options,
@@ -258,9 +257,8 @@ class IRPO(OnPolicyAlgorithm):
         loss = self._policy_loss(params, batch, advantages)
         values = tuple(params.values())
         gradients = torch.autograd.grad(loss, values, create_graph=True, allow_unused=True)
-        assert self.inner_learning_rate is not None
         return {
-            name: value - self.inner_learning_rate * (gradient if gradient is not None else torch.zeros_like(value))
+            name: value - self.subpolicy_learning_rate * (gradient if gradient is not None else torch.zeros_like(value))
             for (name, value), gradient in zip(params.items(), gradients)
         }
 
@@ -291,7 +289,7 @@ class IRPO(OnPolicyAlgorithm):
             return
         parameters = tuple(self.intrinsic_provider.parameters())
         if self._lirpg_optimizer is None:
-            self._lirpg_optimizer = torch.optim.RMSprop(parameters, lr=self.intrinsic_learning_rate)
+            self._lirpg_optimizer = torch.optim.RMSprop(parameters, lr=self.lirpg_learning_rate)
         gradients = torch.autograd.grad(loss, parameters, allow_unused=True, retain_graph=True)
         self._lirpg_optimizer.zero_grad()
         for parameter, gradient in zip(parameters, gradients):

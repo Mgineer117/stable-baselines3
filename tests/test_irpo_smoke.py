@@ -18,7 +18,7 @@ def train(kind: str, **kwargs: str) -> None:
         num_options=2,
         num_subpolicy_updates=2,
         n_steps=4,
-        learning_rate=1e-3,
+        subpolicy_learning_rate=1e-3,
         device="cpu",
         seed=0,
         **kwargs,
