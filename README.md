@@ -43,6 +43,9 @@ Use `"MlpPolicy"` for vector observations and `"CnnPolicy"` for images.
 `num_options` selects the number of IRPO subpolicies; each iteration makes
 `num_subpolicy_updates` differentiable updates per option.
 
+This SB3 port deliberately uses normalized discounted returns as the policy-gradient
+baseline. It does not train separate intrinsic and extrinsic critics.
+
 ## Intrinsic reward
 
 - `random`: fixed random reward functions; no pretraining.

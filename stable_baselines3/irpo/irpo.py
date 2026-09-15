@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -134,6 +135,7 @@ class IRPO(OnPolicyAlgorithm):
         self.allo_encoder_path = allo_encoder_path
         self.drnd_learning_rate = drnd_learning_rate
         self._lirpg_optimizer: torch.optim.Optimizer | None = None
+        self.evaluation_policy: ActorCriticPolicy | None = None
 
         if _init_setup_model:
             self._setup_model()
@@ -148,6 +150,7 @@ class IRPO(OnPolicyAlgorithm):
         ).to(self.device)
         self._action_module = _PolicyAction(self.policy)
         self._evaluation_module = _PolicyEvaluation(self.policy)
+        self.evaluation_policy = deepcopy(self.policy)
 
     def _params(self) -> dict[str, Tensor]:
         return {f"policy.{name}": parameter for name, parameter in self.policy.named_parameters()}
@@ -250,14 +253,33 @@ class IRPO(OnPolicyAlgorithm):
             for (name, value), gradient in zip(params.items(), gradients)
         }
 
-    def _weights(self, scores: Tensor) -> Tensor:
+    def _annealed_temperature(self) -> float:
+        learning_progress = 1.0 - self._current_progress_remaining
+        return max(1e-8, 1.0 - learning_progress / self.temperature)
+
+    def _weights(self, scores: Tensor, temperature: float) -> Tensor:
         if self.aggregation_method == "uniform":
             return torch.full_like(scores, 1.0 / len(scores))
         if self.aggregation_method == "argmax":
             weights = torch.zeros_like(scores)
             weights[scores.argmax()] = 1.0
             return weights
-        return torch.softmax(scores / self.temperature, dim=0)
+        return torch.softmax(scores / temperature, dim=0)
+
+    def _mean_discounted_return(self, batch: _Batch) -> Tensor:
+        rewards = batch.rewards.reshape(batch.n_steps, batch.n_envs)
+        discount = torch.pow(torch.tensor(self.gamma, device=self.device), torch.arange(batch.n_steps, device=self.device))
+        return (rewards * discount[:, None]).sum(dim=0).mean()
+
+    def _select_evaluation_policy(self, params: dict[str, Tensor]) -> None:
+        assert self.evaluation_policy is not None
+        with torch.no_grad():
+            for name, parameter in self.evaluation_policy.named_parameters():
+                parameter.copy_(params[f"policy.{name}"].detach())
+
+    def predict(self, observation: np.ndarray, state: tuple[np.ndarray, ...] | None = None, episode_start: np.ndarray | None = None, deterministic: bool = False):
+        policy = self.evaluation_policy or self.policy
+        return policy.predict(observation, state, episode_start, deterministic)
 
     def _update_lirpg(self, loss: Tensor) -> None:
         if not isinstance(self.intrinsic_provider, LIRPGReward):
@@ -304,6 +326,7 @@ class IRPO(OnPolicyAlgorithm):
 
         while self.num_timesteps < total_timesteps:
             callback.on_rollout_start()
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
             base_params = self._params()
             # Subpolicy sample collection: base rollout, then option rollouts below.
             base_batch = self._collect_batch(self.env, base_params, callback)
@@ -311,6 +334,7 @@ class IRPO(OnPolicyAlgorithm):
                 break
             option_losses: list[Tensor] = []
             scores: list[Tensor] = []
+            final_params: list[dict[str, Tensor]] = []
             complete = True
             for option in range(self.num_options):
                 params = base_params
@@ -333,14 +357,18 @@ class IRPO(OnPolicyAlgorithm):
                     final_batch.rewards, final_batch.dones, final_batch.n_steps, final_batch.n_envs
                 )
                 option_losses.append(self._policy_loss(params, final_batch, external_advantage))
-                scores.append(final_batch.rewards.mean().detach())
+                scores.append(self._mean_discounted_return(final_batch).detach())
+                final_params.append(params)
                 self.intrinsic_provider.update(final_batch.observations, final_batch.next_observations)
             callback.on_rollout_end()
             if not complete:
                 break
 
             score_tensor = torch.stack(scores)
-            weights = self._weights(score_tensor)
+            temperature = self._annealed_temperature()
+            weights = self._weights(score_tensor, temperature)
+            selected_option = score_tensor.argmax().item()
+            self._select_evaluation_policy(final_params[selected_option])
             meta_loss = torch.sum(torch.stack(option_losses) * weights)
             self._update_lirpg(meta_loss)
             # Meta-policy update: apply the option-aggregated outer gradient to SB3 policy.
@@ -351,6 +379,8 @@ class IRPO(OnPolicyAlgorithm):
             self.logger.record("train/meta_gradient_norm", gradient_norm)
             self.logger.record("train/option_return", score_tensor.mean().item())
             self.logger.record("train/option_weight_max", weights.max().item())
+            self.logger.record("train/selected_option", selected_option)
+            self.logger.record("train/temperature", temperature)
             self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
             if log_interval and iteration % log_interval == 0:
                 self.dump_logs(iteration)
@@ -359,4 +389,4 @@ class IRPO(OnPolicyAlgorithm):
         return self
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        return ["policy", "intrinsic_provider"], []
+        return ["policy", "intrinsic_provider", "evaluation_policy"], []
