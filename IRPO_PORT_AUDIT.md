@@ -1,6 +1,21 @@
 # SB3 IRPO mechanical audit
 
-## Verdict
+## Remediation status
+
+The detailed table below is a frozen audit of the earlier `a1e8f93` scaffold.
+The follow-up implementation resolves its main-path defects: source-topology outer
+gradients, exact-distribution-KL TRPO, source-mechanism Random/DRND/LIRPG/ALLO
+providers, construction-time ALLO pretraining, Atari reward clipping, provider
+optimizer persistence, and the broken README API.
+
+The two requested SB3 differences remain: normalized discounted returns without
+IRPO's per-option critics, and serial option rollout collection with a reset per
+rollout. Softmax aggregation, current-final-rollout evaluation selection, and
+ratio-based temperature annealing remain as previously requested. The source's
+specialized goal-conditioned `IRPO_G_Learner` remains a separate, unported
+extension.
+
+## Pre-remediation verdict
 
 `stable-baselines3.IRPO` at `a1e8f93` is **not mechanically equivalent** to the
 research IRPO in `asdf`.  Its results must be described as an SB3-native IRPO
@@ -12,7 +27,7 @@ uses the gradient of that final external update itself as the outer gradient.
 That changes the optimisation problem before any provider-specific difference
 is considered.
 
-## Audit scope
+## Pre-remediation audit scope
 
 | Implementation | Revision / input files |
 | --- | --- |
@@ -29,11 +44,11 @@ Research input SHA-256:
 f4a504d892c93fac14f3847b31a2da3b02e55d85a7329f911c933e5a7fdb425e  algorithms/irpo.py
 ```
 
-## Update topology
+## Pre-remediation update topology
 
 ```mermaid
 flowchart LR
-  B[base rollout, base policy]
+  B[meta-policy rollout]
   B --> R1[research: M option trajectories sampled together]
   R1 --> R2[N differentiable updates per option]
   R2 --> R3[use gradient of final external update]
@@ -48,21 +63,21 @@ Both implementations nominally collect `1 + M(N - 1)` rollout batches per
 IRPO iteration for `M` options and `N` subpolicy updates.  They do not assign
 those batches, return targets, or gradients the same way.
 
-## Parity blockers
+## Pre-remediation gaps
 
 | Area | Research IRPO | SB3 fork | Consequence |
 | --- | --- | --- | --- |
 | **Outer objective** | At the final inner step, `learn_subpolicy()` computes the external actor gradient at `theta_(N-1)`. `backprop()` propagates that gradient through the earlier `N - 1` updates. The final adapted actor `theta_N` is retained for provider updates, inference, and score bookkeeping. `policy/irpo.py:315-354, 691-802`. | `_adapt(..., final=True)` first applies the external update, producing `theta_N`; `learn()` then computes `option_loss = L_ext(theta_N, D_N)`. `stable_baselines3/irpo/irpo.py:261-272, 433-465`. | **Different meta-objective.** SB3 evaluates actions from `D_N`, sampled by `theta_(N-1)`, under `theta_N` without an importance ratio. This is an extra off-policy external loss absent from the research algorithm. |
 | **Advantages and critics** | Each option has independent external and intrinsic critics, each fitted for `CRITIC_EPOCHS`; both use bootstrapped GAE with separate termination/truncation handling. The actor uses intrinsic GAE except on the final update, which uses external GAE. `policy/irpo.py:700-775`, `utils/rl.py:156-210`. | `_returns()` is normalized discounted reward-to-go, starts with zero at every rollout boundary, and treats any `done` as non-bootstrap. No intrinsic/extrinsic critics exist. `stable_baselines3/irpo/irpo.py:238-272`. | This is the deliberate simplification accepted for the fork, but it removes learned baselines, GAE, time-limit bootstrapping, and every critic update. It prevents parity. |
-| **Rollout lifetime** | Worker trajectories continue until an environment termination/truncation; `next_states`, terminations, and truncations enter GAE. `utils/sampler.py:193-245`. | `_collect_batch()` calls `env.reset()` for every base and subpolicy batch, and does not carry `self._last_obs`; the return target has no bootstrap at `n_steps`. `stable_baselines3/irpo/irpo.py:183-247`. | More episode restarts and truncated return targets. This alone changes every subpolicy gradient when `n_steps` is shorter than an episode. |
+| **Rollout lifetime** | Worker trajectories continue until an environment termination/truncation; `next_states`, terminations, and truncations enter GAE. `utils/sampler.py:193-245`. | `_collect_batch()` calls `env.reset()` for every meta-policy and subpolicy batch, and does not carry `self._last_obs`; the return target has no bootstrap at `n_steps`. `stable_baselines3/irpo/irpo.py:183-247`. | More episode restarts and truncated return targets. This alone changes every subpolicy gradient when `n_steps` is shorter than an episode. |
 | **Atari training reward** | Pacman config enables `clip_training_rewards`; the sampler stores `sign(reward)`. `config/envs/pacman.json`, `utils/sampler.py:226-231`. | Stores raw reward from the supplied SB3 environment. `stable_baselines3/irpo/irpo.py:208-212`. | The external inner step, option score, and meta gradient use differently scaled rewards for the configured Pacman experiment. |
 | **Option score and aggregation** | Score is per-option `ext_returns.mean()` from the critic/GAE batch, smoothed as `perf_gains = beta * old + (1-beta) * score`; aggregation uses that EMA. Source retains `argmax`, `uniform`, and `softmax` modes. `policy/irpo.py:522-603`. | Score is one raw discounted final-rollout return; no EMA or `beta`; aggregation is always softmax. `stable_baselines3/irpo/irpo.py:281-287, 457-462`. | The weighting signal has a different estimator and history. Always-softmax and the direct evaluation score were intentional fork decisions, but they are not source parity. |
 | **Evaluation policy** | `forward()` uses the current final subpolicy with highest `perf_gains` EMA. `policy/irpo.py:229-241`. | `predict()` uses a copied final subpolicy with the highest current raw discounted final-rollout score. `stable_baselines3/irpo/irpo.py:289-297, 450-461`. | This implements the later SB3 requirement, but selects a different policy whenever EMA ranking and current-rollout ranking disagree. |
 | **Meta/TRPO constraint** | Copies the old actor and evaluates exact distribution KL; samples at `grad_batch_size`; IRPO calls it with 5 CG steps, 15 backtracks and source target KL/config. `policy/trpo.py:30-132`, `policy/irpo.py:804-825`. | Caps the Fisher sample at 256 observations; estimates KL from actions sampled from the current policy using `exp(log_ratio)-1-log_ratio`; defaults are target KL `0.001`, 5 CG steps, and 10 backtracks. `stable_baselines3/irpo/irpo.py:315-395`. | Both are trust-region-style updates, but their Fisher/KL estimates, line-search budget, and defaults differ. The source Pacman IRPO config sets target KL `0.0003`. |
-| **Sampling concurrency** | After the shared base rollout, all option actors are passed to `OnlineSampler.collect_samples()` together; it forks `num_workers` per policy. `policy/irpo.py:477-504`, `utils/sampler.py:80-170`. | Options are collected one after another from one SB3 `VecEnv`; no option-parallel sampling exists. `stable_baselines3/irpo/irpo.py:429-452`. | Same nominal sample count, materially different wall-clock behaviour and stochastic ordering. The fork does not implement the requested parallel subpolicy sampling. |
+| **Sampling concurrency** | After the shared meta-policy rollout, all option actors are passed to `OnlineSampler.collect_samples()` together; it forks `num_workers` per policy. `policy/irpo.py:477-504`, `utils/sampler.py:80-170`. | Options are collected one after another from one SB3 `VecEnv`; no option-parallel sampling exists. `stable_baselines3/irpo/irpo.py:429-452`. | Same nominal sample count, materially different wall-clock behaviour and stochastic ordering. The fork does not implement the requested parallel subpolicy sampling. |
 | **Goal-conditioned IRPO** | Includes the separate `IRPO_G_Learner` path. `policy/irpo.py:861-1378`, `algorithms/irpo.py:123-136`. | No equivalent path; the constructor rejects `Dict` observations. `stable_baselines3/irpo/irpo.py:115-116`. | Goal-conditioned research experiments cannot be reproduced by the fork. |
 
-## Intrinsic-reward providers
+## Pre-remediation intrinsic-reward providers
 
 | Provider | Research implementation | SB3 implementation | Mechanical difference |
 | --- | --- | --- | --- |
@@ -76,7 +91,7 @@ fixed rewards explicitly use image-aware CNNs, while every SB3 provider starts
 with `Flatten -> LazyLinear(256)`.  SB3's policy may be a `CnnPolicy`, but its
 intrinsic provider is not a CNN provider.
 
-## State, API, and test findings
+## Pre-remediation state, API, and test findings
 
 | Finding | Evidence | Effect |
 | --- | --- | --- |
@@ -86,7 +101,7 @@ intrinsic provider is not a CNN provider.
 | SB3 provider optimizer state is incomplete. | `intrinsic_provider.state_dict()` saves parameters/buffers, not DRND's optimizer; the research providers explicitly add optimizer and RMS state via `get_extra_state()`. `stable_baselines3/irpo/irpo.py:484-485`; `utils/intrinsic_rewards.py:776-803`. | DRND resumes with fresh optimizer moments. |
 | Tests establish plumbing only. | SB3 smoke test trains CartPole for 32 steps and asserts only `num_timesteps >= 32`; ALLO uses an artificial SB3-only checkpoint. `tests/test_irpo_smoke.py`. | Passing smoke tests do not establish source parity, Atari support, or return improvement. |
 
-## Checks run
+## Pre-remediation checks
 
 - SB3 `tests/test_irpo_smoke.py`: passed for `random`, `drnd`, `lirpg`, and its
   synthetic ALLO checkpoint.
@@ -97,7 +112,7 @@ intrinsic provider is not a CNN provider.
 - SB3 LIRPG save/load identity check: reproduced the stale-optimizer mismatch
   above.
 
-## What a comparable SB3 sweep requires
+## Pre-remediation requirements for a comparable SB3 sweep
 
 Do not launch a source-versus-SB3 performance comparison until these are
 resolved in order:

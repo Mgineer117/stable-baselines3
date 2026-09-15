@@ -1,71 +1,86 @@
 # Stable-Baselines3 IRPO
 
-This fork adds **Intrinsic Reward Policy Optimization (IRPO)** to
-Stable-Baselines3. IRPO owns its intrinsic-reward providers:
-`random`, `allo`, `lirpg`, and `drnd`.
-
-> **Status:** The first SB3-native IRPO implementation supports Box observations,
-> `MlpPolicy`/`CnnPolicy`, and SGD meta updates. Atari and MuJoCo parity with the
-> research implementation are still being validated.
+This fork adds `stable_baselines3.IRPO`: Intrinsic Reward Policy Optimization
+with `random`, `allo`, `lirpg`, and `drnd` intrinsic-reward providers.
 
 ## Install
-
-Install this fork in place of upstream Stable-Baselines3:
 
 ```bash
 pip install --upgrade \
   "stable-baselines3 @ git+https://github.com/Mgineer117/stable-baselines3.git@irpo"
 ```
 
-## Use IRPO
+## Pacman
 
 ```python
 import gymnasium as gym
 from stable_baselines3 import IRPO
 
-env = gym.make("ALE/MsPacman-v5")
+env = gym.make("ALE/Pacman-v5")
 model = IRPO(
     "CnnPolicy",
     env,
     intrinsic_reward="drnd",  # random | allo | lirpg | drnd
     num_options=3,
     num_subpolicy_updates=5,
-    subpolicy_learning_rate=3e-4,
-    temperature_anneal_timing=0.5,
+    subpolicy_learning_rate=1e-4,
+    drnd_learning_rate=3e-5,
+    drnd_feature_dim=16,
     n_steps=128,
-    batch_size=128,
+    clip_training_rewards=True,
+    temperature_anneal_timing=0.5,
     verbose=1,
 )
 model.learn(100_000_000)
 model.save("irpo_drnd_pacman")
 ```
 
-Use `"MlpPolicy"` for vector observations and `"CnnPolicy"` for images.
-`num_options` selects the number of IRPO subpolicies; each iteration makes
-`num_subpolicy_updates` differentiable updates per option.
+Use `MlpPolicy` for vector observations and `CnnPolicy` for channel-first image
+observations. Intrinsic image providers use their own Nature-style CNNs; they
+do not flatten Atari frames into an MLP.
 
-This SB3 port deliberately uses normalized discounted returns as the policy-gradient
-baseline. It does not train separate intrinsic and extrinsic critics.
-Subpolicy updates use a fixed `subpolicy_learning_rate`. `lirpg_learning_rate`,
-`drnd_learning_rate`, and `allo_learning_rate` control their respective providers.
+Each IRPO outer update collects a meta-policy rollout, performs
+`num_subpolicy_updates` differentiable updates per option, uses the gradient of
+the final external subpolicy update for the TRPO meta update, then selects the
+final subpolicy with the highest mean discounted return for `predict()`.
+Selection happens after every completed IRPO outer update.
 
-## Intrinsic reward
+## Intrinsic rewards
 
-- `random`: fixed random reward functions; no pretraining.
-- `drnd`: discounted random-network-distillation reward; no pretraining.
-- `lirpg`: learned intrinsic reward; no pretraining.
-- `allo`: frozen ALLO encoder. Pretrain the encoder, then pass its checkpoint:
+- `random` uses fixed signed temporal feature differences and a reward RMS.
+- `drnd` uses one ten-target DRND ensemble, novelty RMS, masked predictor
+  updates, and a provider-local GAE critic for each option.
+- `lirpg` uses an action-conditioned learned reward, an external critic, and
+  the source virtual clipped-policy update. Its default coefficients are
+  `lirpg_r_ex_coef=1.0`, `lirpg_r_in_coef=0.01`, and
+  `lirpg_v_ex_coef=0.5`.
+- `allo` pretrains its temporal-eigenfunction encoder during `IRPO`
+  construction. It uses 100,000 random image transitions or 200,000 vector
+  transitions and 10,000 ALLO updates by default. Reduce those only for a
+  smoke run, for example:
 
 ```python
 model = IRPO(
-    "CnnPolicy",
+    "MlpPolicy",
     env,
     intrinsic_reward="allo",
-    allo_encoder_path="allo_encoder.pt",
+    allo_pretrain_timesteps=2_000,
+    allo_pretrain_updates=100,
 )
 ```
 
-`allo_encoder_path` is required only for ALLO. Saving an IRPO model preserves
-the selected intrinsic provider and its state.
+`allo_learning_rate`, `drnd_learning_rate`, and `lirpg_learning_rate` control
+their corresponding providers. Provider weights, normalizers, and optimizer
+state are saved with `model.save()`.
 
-`temperature_anneal_timing` is the fraction of `learn(total_timesteps=...)` at which softmax aggregation reaches its argmax limit. `0.1` means 10% of the training budget; `0` uses argmax immediately.
+## Deliberate SB3 differences
+
+The core IRPO inner update uses normalized discounted reward-to-go rather than
+research IRPO's per-option intrinsic/extrinsic critics. Each option rollout is
+collected serially from an SB3 `VecEnv` and begins with `reset()`. These are
+intentional SB3 choices; they make this implementation a distinct variant for
+those two mechanisms.
+
+Softmax aggregation is always used. `temperature_anneal_timing` is the fraction
+of `learn(total_timesteps=...)` when its temperature reaches the argmax limit:
+`0.1` means 10% of the requested budget, and `0` is argmax immediately.
