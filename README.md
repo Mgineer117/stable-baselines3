@@ -31,7 +31,7 @@ model = IRPO(
     num_options=3,
     num_subpolicy_updates=5,
     subpolicy_learning_rate=3e-4,
-    temperature_anneal_timesteps=50_000_000,
+    temperature_anneal_timing=0.5,
     n_steps=128,
     batch_size=128,
     verbose=1,
@@ -68,4 +68,4 @@ model = IRPO(
 `allo_encoder_path` is required only for ALLO. Saving an IRPO model preserves
 the selected intrinsic provider and its state.
 
-`temperature_anneal_timesteps` is the absolute training step at which softmax aggregation reaches its argmax limit.
+`temperature_anneal_timing` is the fraction of `learn(total_timesteps=...)` at which softmax aggregation reaches its argmax limit. `0.1` means 10% of the training budget; `0` uses argmax immediately.
