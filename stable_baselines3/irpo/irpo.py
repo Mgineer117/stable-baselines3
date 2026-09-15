@@ -72,23 +72,28 @@ class IRPO(OnPolicyAlgorithm):
         self,
         policy: str | type[ActorCriticPolicy],
         env: GymEnv | str,
-        subpolicy_learning_rate: float = 3e-4,
         n_steps: int = 128,
         gamma: float = 0.99,
         ent_coef: float = 0.0,
-        intrinsic_reward: IntrinsicReward = "random",
+        # Subpolicy hyperparameters.
         num_options: int = 3,
+        subpolicy_learning_rate: float = 3e-4,
         num_subpolicy_updates: int = 5,
+        # Intrinsic-reward hyperparameters.
+        intrinsic_reward: IntrinsicReward = "random",
         lirpg_learning_rate: float = 7e-4,
         drnd_learning_rate: float = 1e-4,
         allo_learning_rate: float = 3e-4,
         allo_encoder_path: str | None = None,
+        # Meta-policy hyperparameters.
         temperature: float = 1.0,
+        temperature_anneal_timesteps: int | None = None,
         target_kl: float = 0.001,
         trpo_damping: float = 0.1,
         trpo_cg_steps: int = 5,
         trpo_backtrack_iters: int = 10,
         trpo_backtrack_coeff: float = 0.7,
+        # Logging and device.
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
         policy_kwargs: dict[str, Any] | None = None,
@@ -103,6 +108,8 @@ class IRPO(OnPolicyAlgorithm):
             raise ValueError("num_subpolicy_updates must be at least 2")
         if temperature <= 0:
             raise ValueError("temperature must be positive")
+        if temperature_anneal_timesteps is not None and temperature_anneal_timesteps < 1:
+            raise ValueError("temperature_anneal_timesteps must be positive")
         if target_kl <= 0 or trpo_damping < 0 or trpo_cg_steps < 1 or trpo_backtrack_iters < 1:
             raise ValueError("invalid TRPO hyperparameters")
         if not isinstance(env, str) and isinstance(env.observation_space, spaces.Dict):
@@ -135,6 +142,8 @@ class IRPO(OnPolicyAlgorithm):
         self.subpolicy_learning_rate = subpolicy_learning_rate
         self.lirpg_learning_rate = lirpg_learning_rate
         self.temperature = temperature
+        self.temperature_anneal_timesteps = temperature_anneal_timesteps
+        self._active_temperature_anneal_timesteps: int | None = None
         self.target_kl = target_kl
         self.trpo_damping = trpo_damping
         self.trpo_cg_steps = trpo_cg_steps
@@ -263,8 +272,9 @@ class IRPO(OnPolicyAlgorithm):
         }
 
     def _annealed_temperature(self) -> float:
-        learning_progress = 1.0 - self._current_progress_remaining
-        return max(1e-8, 1.0 - learning_progress / self.temperature)
+        assert self._active_temperature_anneal_timesteps is not None
+        progress = min(1.0, self.num_timesteps / self._active_temperature_anneal_timesteps)
+        return max(1e-8, self.temperature * (1.0 - progress))
 
     def _weights(self, scores: Tensor, temperature: float) -> Tensor:
         return torch.softmax(scores / temperature, dim=0)
@@ -399,6 +409,9 @@ class IRPO(OnPolicyAlgorithm):
         )
         callback.on_training_start(locals(), globals())
         assert self.env is not None
+        self._active_temperature_anneal_timesteps = (
+            self.temperature_anneal_timesteps or total_timesteps
+        )
         iteration = 0
 
         while self.num_timesteps < total_timesteps:
