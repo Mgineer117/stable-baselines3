@@ -79,11 +79,10 @@ class IRPO(OnPolicyAlgorithm):
         intrinsic_reward: IntrinsicReward = "random",
         num_options: int = 3,
         num_subpolicy_updates: int = 5,
-        inner_learning_rate: float | None = None,
+        inner_learning_rate: float = 5e-3,
         intrinsic_learning_rate: float = 7e-4,
         drnd_learning_rate: float = 1e-4,
         allo_encoder_path: str | None = None,
-        aggregation_method: Literal["uniform", "softmax", "argmax"] = "softmax",
         temperature: float = 1.0,
         target_kl: float = 0.001,
         trpo_damping: float = 0.1,
@@ -102,8 +101,6 @@ class IRPO(OnPolicyAlgorithm):
             raise ValueError("num_options must be positive")
         if num_subpolicy_updates < 2:
             raise ValueError("num_subpolicy_updates must be at least 2")
-        if aggregation_method not in {"uniform", "softmax", "argmax"}:
-            raise ValueError("aggregation_method must be 'uniform', 'softmax', or 'argmax'")
         if temperature <= 0:
             raise ValueError("temperature must be positive")
         if target_kl <= 0 or trpo_damping < 0 or trpo_cg_steps < 1 or trpo_backtrack_iters < 1:
@@ -136,7 +133,6 @@ class IRPO(OnPolicyAlgorithm):
         self.num_subpolicy_updates = num_subpolicy_updates
         self.inner_learning_rate = inner_learning_rate
         self.intrinsic_learning_rate = intrinsic_learning_rate
-        self.aggregation_method = aggregation_method
         self.temperature = temperature
         self.target_kl = target_kl
         self.trpo_damping = trpo_damping
@@ -273,12 +269,6 @@ class IRPO(OnPolicyAlgorithm):
         return max(1e-8, 1.0 - learning_progress / self.temperature)
 
     def _weights(self, scores: Tensor, temperature: float) -> Tensor:
-        if self.aggregation_method == "uniform":
-            return torch.full_like(scores, 1.0 / len(scores))
-        if self.aggregation_method == "argmax":
-            weights = torch.zeros_like(scores)
-            weights[scores.argmax()] = 1.0
-            return weights
         return torch.softmax(scores / temperature, dim=0)
 
     def _mean_discounted_return(self, batch: _Batch) -> Tensor:
