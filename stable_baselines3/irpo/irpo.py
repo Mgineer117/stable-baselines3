@@ -83,15 +83,14 @@ class IRPO(OnPolicyAlgorithm):
         n_steps: int = 128,
         gamma: float = 0.99,
         gae_lambda: float = 0.98,
-        ent_coef: float = 1e-3,
-        clip_training_rewards: bool = True,
+        ent_coef: float = 0.0,
         # Subpolicy hyperparameters.
         num_options: int = 3,
-        subpolicy_learning_rate: float = 1e-4,
-        num_subpolicy_updates: int = 2,
+        subpolicy_learning_rate: float = 3e-3,
+        num_subpolicy_updates: int = 5,
         # Intrinsic-reward hyperparameters.
         intrinsic_reward: IntrinsicReward = "random",
-        drnd_learning_rate: float = 3e-4,
+        drnd_learning_rate: float = 1e-4,
         allo_learning_rate: float = 1e-4,
         lirpg_learning_rate: float = 1e-4,
         lirpg_r_ex_coef: float = 1.0,
@@ -103,13 +102,13 @@ class IRPO(OnPolicyAlgorithm):
         allo_pretrain_collect_batch_size: int = 10_000,
         # Meta-policy hyperparameters.
         temperature: float = 1.0,
-        temperature_anneal_timing: float = 1.0,
-        target_kl: float = 3e-4,
+        temperature_anneal_timing: float = 0.3,
+        target_kl: float = 1e-3,
         trpo_damping: float = 0.1,
         trpo_cg_steps: int = 5,
-        trpo_backtrack_iters: int = 15,
+        trpo_backtrack_iters: int = 10,
         trpo_backtrack_coeff: float = 0.7,
-        trpo_batch_size: int = 64,
+        trpo_batch_size: int = 128,
         # Logging and device.
         stats_window_size: int = 100,
         tensorboard_log: str | None = None,
@@ -155,7 +154,6 @@ class IRPO(OnPolicyAlgorithm):
         self.num_options = num_options
         self.num_subpolicy_updates = num_subpolicy_updates
         self.subpolicy_learning_rate = subpolicy_learning_rate
-        self.clip_training_rewards = clip_training_rewards
         self.lirpg_learning_rate = lirpg_learning_rate
         self.drnd_learning_rate = drnd_learning_rate
         self.allo_learning_rate = allo_learning_rate
@@ -286,7 +284,7 @@ class IRPO(OnPolicyAlgorithm):
             next_observations.append(successor)
             actions.append(np.array(sampled_actions, copy=True))
             log_probs.append(np.asarray(sampled_log_probs, dtype=np.float32).copy())
-            rewards.append((np.sign(reward) if self.clip_training_rewards else reward).astype(np.float32, copy=True))
+            rewards.append(np.asarray(reward, dtype=np.float32).copy())
             dones.append(np.asarray(done, dtype=np.float32).copy())
             terminations.append(terminated.astype(np.float32))
             truncations.append(truncated.astype(np.float32))

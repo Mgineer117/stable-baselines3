@@ -13,10 +13,11 @@ pip install --upgrade \
 ## Pacman
 
 ```python
-import gymnasium as gym
 from stable_baselines3 import IRPO
+from stable_baselines3.common.env_util import make_atari_env
+from stable_baselines3.common.vec_env import VecFrameStack
 
-env = gym.make("ALE/Pacman-v5")
+env = VecFrameStack(make_atari_env("ALE/Pacman-v5", n_envs=1), n_stack=4)
 model = IRPO(
     "CnnPolicy",
     env,
@@ -27,7 +28,6 @@ model = IRPO(
     drnd_learning_rate=3e-5,
     drnd_feature_dim=16,
     n_steps=128,
-    clip_training_rewards=True,
     temperature_anneal_timing=0.5,
     verbose=1,
 )
