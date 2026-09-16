@@ -534,7 +534,7 @@ class IRPO(OnPolicyAlgorithm):
             # self.logger.record("train/trpo_backtrack", backtrack)
             # self.logger.record("train/trpo_success", trpo_success)
             self.logger.record("train/trpo_kl", trpo_kl)
-            self.logger.record("train/option_return", score_tensor.mean().item())
+            self.logger.record("train/option_return", score_tensor[selected_option].item())
             # self.logger.record("train/option_weight_max", weights.max().item())
             self.logger.record("train/selected_option", selected_option)
             self.logger.record("train/temperature", temperature)
