@@ -528,10 +528,10 @@ class IRPO(OnPolicyAlgorithm):
             self.logger.record("train/meta_loss", meta_loss.item())
             if self._allo_pretraining_steps:
                 self.logger.record("train/allo_pretraining_timesteps", self._allo_pretraining_steps)
-            # self.logger.record("train/meta_gradient_norm", gradient_norm)
+            self.logger.record("train/meta_gradient_norm", gradient_norm)
             # self.logger.record("train/trpo_backtrack", backtrack)
             # self.logger.record("train/trpo_success", trpo_success)
-            self.logger.record("train/trpo_kl", trpo_kl)
+            self.logger.record("train/meta-policy kl", trpo_kl)
             self.logger.record("train/option_return", score_tensor[selected_option].item())
             # self.logger.record("train/option_weight_max", weights.max().item())
             self.logger.record("train/selected_option", selected_option)
