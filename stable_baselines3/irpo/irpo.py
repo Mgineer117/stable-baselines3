@@ -182,12 +182,12 @@ class IRPO(OnPolicyAlgorithm):
         gae_lambda: float = 0.98,
         ent_coef: float = 0.0,
         # Subpolicy hyperparameters.
-        num_options: int = 2,
+        num_options: int = 1,
         subpolicy_learning_rate: float = 1e-3,
         critic_learning_rate: float = 1e-3,
         critic_batch_size: int = 256,
         critic_n_epochs: int = 5,
-        num_subpolicy_updates: int = 3,
+        num_subpolicy_updates: int = 5,
         # Intrinsic-reward hyperparameters.
         intrinsic_reward: IntrinsicReward = "lirpg",
         drnd_learning_rate: float = 1e-4,
