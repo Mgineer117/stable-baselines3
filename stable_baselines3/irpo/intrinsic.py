@@ -139,8 +139,9 @@ class IntrinsicRewardProvider(nn.Module):
         policy_evaluate: PolicyEvaluate | None = None,
         params: dict[str, Tensor] | None = None,
         subpolicy_learning_rate: float | None = None,
-    ) -> None:
-        return None
+        external_advantages: Tensor | None = None,
+    ) -> dict[str, float]:
+        return {}
 
 
 class RandomReward(IntrinsicRewardProvider):
@@ -203,13 +204,9 @@ class _DRNDSlot(nn.Module):
     def __init__(self, observation_space: spaces.Box, learning_rate: float, critic_learning_rate: float, feature_dim: int, gamma: float, gae_lambda: float, update_proportion: float) -> None:
         super().__init__()
         self.drnd = _DRNDModel(observation_space, feature_dim)
-        self.critic = _ValueNetwork(observation_space)
         self.reward_rms = _RunningVariance()
-        self.gamma, self.gae_lambda, self.update_proportion = gamma, gae_lambda, update_proportion
-        self.optimizer = torch.optim.Adam([
-            {"params": self.drnd.parameters(), "lr": learning_rate},
-            {"params": self.critic.parameters(), "lr": critic_learning_rate},
-        ])
+        self.update_proportion = update_proportion
+        self.optimizer = torch.optim.Adam(self.drnd.parameters(), lr=learning_rate)
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda _: 1.0)
 
     def raw_reward(self, next_observations: Tensor) -> Tensor:
@@ -247,7 +244,7 @@ class DRNDReward(IntrinsicRewardProvider):
                 result[option] = slot.reward_rms.normalize_var_only(slot.raw_reward(batch.next_observations), update=False)
         return result
 
-    def update(self, batch: Any, option: int, **_: Any) -> None:
+    def update(self, batch: Any, option: int, **_: Any) -> dict[str, float]:
         slot = self.slots[option]
         prediction, targets = slot.drnd(batch.next_observations)
         target_index = torch.randint(targets.shape[0], (batch.next_observations.shape[0],), device=prediction.device)
@@ -257,18 +254,18 @@ class DRNDReward(IntrinsicRewardProvider):
         drnd_loss = (error * mask).sum() / mask.sum().clamp_min(1)
         with torch.no_grad():
             rewards = slot.reward_rms.normalize_var_only(slot.raw_reward(batch.next_observations), update=False)
-            _, returns = _gae(
-                rewards, batch.terminations, batch.truncations, slot.critic(batch.observations).flatten(),
-                slot.critic(batch.next_observations).flatten(), slot.gamma, slot.gae_lambda, batch.n_steps, batch.n_envs,
-            )
-        critic_loss = nn.functional.mse_loss(slot.critic(batch.observations).flatten(), returns)
         slot.optimizer.zero_grad()
-        (drnd_loss + critic_loss).backward()
-        torch.nn.utils.clip_grad_norm_(list(slot.drnd.parameters()) + list(slot.critic.parameters()), 0.5)
+        drnd_loss.backward()
+        torch.nn.utils.clip_grad_norm_(slot.drnd.parameters(), 0.5)
         slot.optimizer.step()
         slot.lr_scheduler.step()
         with torch.no_grad():
             slot.reward_rms.update(slot.raw_reward(batch.next_observations))
+        return {
+            "loss": drnd_loss.item(),
+            "predictor_loss": drnd_loss.item(),
+            "intrinsic_reward_mean": rewards.mean().item(),
+        }
 
     def get_extra_state(self) -> dict[str, Any]:
         return {
@@ -310,12 +307,8 @@ class _LIRPGSlot(nn.Module):
     def __init__(self, observation_space: spaces.Box, action_space: spaces.Space, learning_rate: float, critic_learning_rate: float, optimizer: str) -> None:
         super().__init__()
         self.reward = _LIRPGRewardNetwork(observation_space, action_space)
-        self.critic = _ValueNetwork(observation_space)
         optimizer_cls = torch.optim.RMSprop if optimizer == "rmsprop" else torch.optim.Adam
-        self.optimizer = optimizer_cls([
-            {"params": self.reward.parameters(), "lr": learning_rate},
-            {"params": self.critic.parameters(), "lr": critic_learning_rate},
-        ])
+        self.optimizer = optimizer_cls(self.reward.parameters(), lr=learning_rate)
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda _: 1.0)
 
 
@@ -334,7 +327,7 @@ class LIRPGReward(IntrinsicRewardProvider):
         clip_range: float = 0.2,
         critic_learning_rate: float = 1e-4,
         optimizer: str = "adam",
-    ) -> None:
+    ) -> dict[str, float]:
         super().__init__()
         self.slots = nn.ModuleList([
             _LIRPGSlot(observation_space, action_space, learning_rate, critic_learning_rate, optimizer)
@@ -355,15 +348,12 @@ class LIRPGReward(IntrinsicRewardProvider):
         policy_evaluate: PolicyEvaluate | None = None,
         params: dict[str, Tensor] | None = None,
         subpolicy_learning_rate: float | None = None,
+        external_advantages: Tensor | None = None,
     ) -> None:
-        if policy_evaluate is None or params is None or subpolicy_learning_rate is None:
-            raise ValueError("LIRPG requires the final subpolicy functional parameters")
+        if policy_evaluate is None or params is None or subpolicy_learning_rate is None or external_advantages is None:
+            raise ValueError("LIRPG requires final subpolicy parameters and external GAE advantages")
         slot = self.slots[option]
-        with torch.no_grad():
-            external_advantage, external_returns = _gae(
-                batch.rewards, batch.terminations, batch.truncations, slot.critic(batch.observations).flatten(),
-                slot.critic(batch.next_observations).flatten(), self.gamma, self.gae_lambda, batch.n_steps, batch.n_envs,
-            )
+        external_advantage = external_advantages.detach()
         intrinsic_rewards = slot.reward(batch.observations, batch.actions)
         mixed = self.r_ex_coef * external_advantage + self.r_in_coef * intrinsic_rewards
         mixed = (mixed - mixed.mean()) / (mixed.std(unbiased=False) + 1e-8)
@@ -382,12 +372,16 @@ class LIRPGReward(IntrinsicRewardProvider):
             lookahead_ratio * external_advantage,
             lookahead_ratio.clamp(1 - self.clip_range, 1 + self.clip_range) * external_advantage,
         ).mean()
-        value_loss = nn.functional.mse_loss(slot.critic(batch.observations).flatten(), external_returns)
         slot.optimizer.zero_grad()
-        (meta_loss + self.v_ex_coef * value_loss).backward()
-        torch.nn.utils.clip_grad_norm_(list(slot.reward.parameters()) + list(slot.critic.parameters()), 0.5)
+        meta_loss.backward()
+        torch.nn.utils.clip_grad_norm_(slot.reward.parameters(), 0.5)
         slot.optimizer.step()
         slot.lr_scheduler.step()
+        return {
+            "loss": meta_loss.item(),
+            "meta_loss": meta_loss.item(),
+            "intrinsic_reward_mean": intrinsic_rewards.mean().item(),
+        }
 
     def get_extra_state(self) -> dict[str, Any]:
         return {
